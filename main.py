@@ -58,7 +58,7 @@ def train_and_eval_ddp(args, use_ddp=True):
         # dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         
         os.environ["GLOO_DEBUG"] = "NONE"
-        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         
         torch.cuda.set_device(rank)
         # print(f"[Rank {rank}] Ready")
@@ -120,8 +120,8 @@ def train_and_eval_ddp(args, use_ddp=True):
     sparse_params = embedding_layer.get_sparse_parameters()
 
     # Optimizer
-    dense_opt = optim.AdamW(dense_params, lr=args["dense_lr"], fused=True)
-    sparse_opt = optim.SparseAdam(sparse_params, lr=args["sparse_lr"])
+    dense_opt = optim.AdamW(dense_params, lr=args["dense_lr"], fused=False)
+    sparse_opt = optim.AdamW(sparse_params, lr=args["sparse_lr"])
 
     if use_ddp:
         embedding_layer = embedding_layer.to(rank)
@@ -168,7 +168,7 @@ def eval_ddp(args, use_ddp=True):
         # dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         
         os.environ["GLOO_DEBUG"] = "NONE"
-        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
+        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
         
         torch.cuda.set_device(rank)
         # print(f"[Rank {rank}] Ready")
@@ -193,7 +193,7 @@ def eval_ddp(args, use_ddp=True):
         mode="train",
         batch_size=args["batch_size"],
         max_seq_len=1000,
-        num_workers=2,
+        num_workers=0,
         shuffle=args["shuffle"],
         shuffle_buffer_size=args["shuffle_buffer_size"],
         rank=rank,
@@ -230,8 +230,8 @@ def eval_ddp(args, use_ddp=True):
     sparse_params = embedding_layer.get_sparse_parameters()
 
     # Optimizer
-    dense_opt = optim.AdamW(dense_params, lr=args["dense_lr"], fused=True)
-    sparse_opt = optim.SparseAdam(sparse_params, lr=args["sparse_lr"])
+    dense_opt = optim.AdamW(dense_params, lr=args["dense_lr"], fused=False)
+    sparse_opt = optim.AdamW(sparse_params, lr=args["sparse_lr"])
     
     try:
         dense_ckpt_path = args["dense_ckpt_path"]

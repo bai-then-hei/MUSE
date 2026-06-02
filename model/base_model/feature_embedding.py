@@ -88,7 +88,7 @@ class FeatureEmbeddingDict(nn.Module):
             dim = self.dim
             if column in ["130_3", "130_4", "130_5"]:
                 dim = self.dim // 2
-            self.embedding_layers[column] = nn.Embedding(len(self.feature_maps[column])+1, dim, padding_idx=0, sparse=is_sparse, dtype=torch.float32)
+            self.embedding_layers[column] = nn.Embedding(len(self.feature_maps[column])+1, dim, padding_idx=0, sparse=False, dtype=torch.float32)
 
         # self.embedding_layers["205"] = nn.Embedding(len(self.feature_maps["205"])+1, dim, padding_idx=0, sparse=is_sparse, dtype=torch.float32)
         # self.embedding_layers["206"] = nn.Embedding(len(self.feature_maps["206"])+1, dim, padding_idx=0, sparse=is_sparse, dtype=torch.float32)
@@ -107,8 +107,7 @@ class FeatureEmbeddingDict(nn.Module):
     def get_sparse_parameters(self):
         params = []
         for name, module in self.embedding_layers.items():
-            if module.sparse:
-                params += list(module.parameters())
+            params += list(module.parameters())
         return params
     
     def init_weights(self):
@@ -117,19 +116,18 @@ class FeatureEmbeddingDict(nn.Module):
             nn.init.trunc_normal_(layer.weight[1:, :], mean=0, std=0.001, a=-2.0, b=2.0)
 
     def broadcast_np_load_ddp(self, file_path):
-        objects_to_broadcast = [None]
-        rank = dist.get_rank()
-        if rank == 0:
-            array_data = np.load(file_path)
-            if isinstance(array_data, np.memmap):
-                array_data = np.array(array_data)
+        if self.world_size > 1:
+            if not hasattr(self, '_gloo_group'):
+                self._gloo_group = dist.new_group(backend='gloo')
+            if dist.get_rank() == 0:
+                data = np.load(file_path)
             else:
-                array_data = array_data.copy()
-            objects_to_broadcast[0] = array_data
+                data = None
+            objects = [data]
+            dist.broadcast_object_list(objects, src=0, group=self._gloo_group)
+            return objects[0]
         else:
-            objects_to_broadcast[0] = None
-        dist.broadcast_object_list(objects_to_broadcast, src=0)
-        return objects_to_broadcast[0]
+            return np.load(file_path)
 
     def create_scl_embedding_table(
         self, 
