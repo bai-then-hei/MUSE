@@ -81,14 +81,21 @@ class Trainer:
         if self.is_main_process:
             logging.info("Start training...")
         self._total_steps = 0
-        for epoch in range(self.args["epochs"]):
+        start_epoch = int(self.args.get("start_epoch", 0))
+        for epoch in range(start_epoch, self.args["epochs"]):
             self._epoch_index = epoch
             self.train_epoch()
-        
-        if "save_ckpt" in self.args and self.args["save_ckpt"] and self.rank == 0:
+            # 每一轮训练和检查点保存（在 train_epoch 末尾触发）后进行评估
+            self.eval()
+            
+        # Save one final checkpoint only when per-epoch saving is disabled.
+        if (
+            "save_ckpt" in self.args
+            and self.args["save_ckpt"]
+            and self.rank == 0
+            and not self.args.get("save_each_epoch", True)
+        ):
             self.save_model()
-
-        self.eval()
 
     def train_epoch(self):
         self._batch_index = 0
@@ -115,6 +122,14 @@ class Trainer:
         
         # log at last train step
         self.log_metric(auc, gauc, loss_reduced.item(), train_loss, "Train")
+
+        if (
+            "save_ckpt" in self.args
+            and self.args["save_ckpt"]
+            and self.rank == 0
+            and self.args.get("save_each_epoch", True)
+        ):
+            self.save_model(epoch=self._epoch_index)
     
     def forward_step(self, batch, mode="train"):
         if mode == "train":
@@ -414,15 +429,30 @@ class Trainer:
         id_counts_dict["205"] = torch.load("./ckpt/id_counts_target.pt").to(self.device)
         self.id_counts_dict = id_counts_dict
     
-    def save_model(self):
+    def save_model(self, epoch=None):
+        if self.rank != 0:
+            return
+
         if "ckpt_path" in self.args:
             ckpt_path = self.args["ckpt_path"]
         else:
             ckpt_path = "./ckpt"
+        
+        os.makedirs(ckpt_path, exist_ok=True)
 
-        self.dense_model.module.save_ckpt(ckpt_path=os.path.join(ckpt_path, f"{self.args['exp_name']}_dense.ckpt"), rank=self.rank)
-        self.sparse_model.module.save_ckpt(ckpt_path=os.path.join(ckpt_path, f"{self.args['exp_name']}_sparse.ckpt"), rank=self.rank)
-        # torch.save(self.id_counts.cpu(), "id_counts.pt")
+        if epoch is None:
+            dense_name = f"{self.args['exp_name']}_dense.ckpt"
+            sparse_name = f"{self.args['exp_name']}_sparse.ckpt"
+        else:
+            dense_name = f"{self.args['exp_name']}_epoch{epoch}_dense.ckpt"
+            sparse_name = f"{self.args['exp_name']}_epoch{epoch}_sparse.ckpt"
+
+        dense_model = self.dense_model.module if hasattr(self.dense_model, "module") else self.dense_model
+        sparse_model = self.sparse_model.module if hasattr(self.sparse_model, "module") else self.sparse_model
+
+        dense_model.save_ckpt(ckpt_path=os.path.join(ckpt_path, dense_name), rank=self.rank)
+        sparse_model.save_ckpt(ckpt_path=os.path.join(ckpt_path, sparse_name), rank=self.rank)
+        logging.info(f"Successfully saved checkpoints to {ckpt_path}")
 
     # @torch.no_grad()
     # def filter_seq_item_id(self, batch):

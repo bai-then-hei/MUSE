@@ -198,7 +198,7 @@ class MUSE_DIN(torch.nn.Module):
             'fc_tower': self.fc_tower.state_dict()
         }
 
-        # os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         torch.save(state_dict, ckpt_path)
         logging.info(f"Checkpoint saved to {ckpt_path}")
     

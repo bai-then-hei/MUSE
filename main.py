@@ -25,14 +25,19 @@ def setup_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def init_logging():
+def init_logging(config):
+    log_handlers = [logging.StreamHandler()]
+    
+    if "log_dir" in config and config["log_dir"]:
+        os.makedirs(config["log_dir"], exist_ok=True)
+        log_file = os.path.join(config["log_dir"], f"{config.get('exp_name', 'train')}.log")
+        log_handlers.append(logging.FileHandler(log_file))
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',
-        handlers=[
-            logging.StreamHandler()
-        ],
+        handlers=log_handlers,
         force=True
     )
 
@@ -132,6 +137,21 @@ def train_and_eval_ddp(args, use_ddp=True):
         embedding_layer = embedding_layer.cuda()
         din_model = din_model.cuda()
     
+    resume_from_ckpt = bool(args.get("resume_from_ckpt", False))
+    resume_dense_ckpt_path = args.get("dense_ckpt_path")
+    resume_sparse_ckpt_path = args.get("sparse_ckpt_path")
+    if resume_from_ckpt:
+        if not resume_dense_ckpt_path or not resume_sparse_ckpt_path:
+            raise ValueError("resume_from_ckpt is true, but dense_ckpt_path or sparse_ckpt_path is missing")
+        if use_ddp:
+            din_model.module.load_ckpt(resume_dense_ckpt_path)
+            embedding_layer.module.load_ckpt(resume_sparse_ckpt_path)
+        else:
+            din_model.load_ckpt(resume_dense_ckpt_path)
+            embedding_layer.load_ckpt(resume_sparse_ckpt_path)
+        if rank == 0:
+            logging.info(f"Resumed training from checkpoints: {resume_dense_ckpt_path}, {resume_sparse_ckpt_path}")
+
     # Trainer
     trainer = Trainer(
         dense_model=din_model,
@@ -304,9 +324,12 @@ def main():
     parser.add_argument('--embedding_dim', type=int, help='Embedding dimension')
     parser.add_argument('--method', type=str, help='Method name: e.g., muse')
     parser.add_argument('--exp_name', type=str, help='Exp name')
-    parser.add_argument('--shuffle', action='store_true', help='Shuffle data')
+    parser.add_argument('--shuffle', action='store_true',default=None, help='Shuffle data')
     parser.add_argument('--shuffle_buffer_size', type=int, help='Shuffle buffer size')
-    parser.add_argument('--use_ddp', action='store_true', help='Use DDP for distributed training')
+    parser.add_argument('--use_ddp', action='store_true',default=None, help='Use DDP for distributed training')
+    parser.add_argument('--save_ckpt', action='store_true',default=None, help='Whether to save checkpoint')
+    parser.add_argument('--ckpt_path', type=str,default=None, help='Path to save checkpoints')
+    parser.add_argument('--log_dir', type=str,default=None, help='Directory to save logs')
 
     args, remaining = parser.parse_known_args()
 
@@ -320,8 +343,7 @@ def main():
     cli_args.pop('config', None)
 
     config.update(cli_args)
-    
-    init_logging()
+    init_logging(config)
 
     if config["job_type"] == "train":
         train_and_eval_ddp(args=config, use_ddp=config["use_ddp"])

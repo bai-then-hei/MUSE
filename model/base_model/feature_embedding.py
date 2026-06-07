@@ -319,7 +319,7 @@ class FeatureEmbeddingDict(nn.Module):
 
         state_dict = {'embedding_layers': self.embedding_layers.state_dict()}
 
-        # os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         torch.save(state_dict, ckpt_path)
         logging.info(f"Checkpoint saved to {ckpt_path}")
     
