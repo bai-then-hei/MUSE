@@ -7,6 +7,7 @@ import torch.distributed as dist
 
 from model.base_model.simtier import cosine_simtier_list
 from model.base_model.layers import multi_head_att, multi_head_att_v2, fc_repeats
+from model.base_model.bls import HyBroadFusion
 
 from utils.utils import clip_prop, write_info_to_file
 
@@ -41,9 +42,32 @@ class MUSE_DIN(torch.nn.Module):
         # self.uni_att_cate = multi_head_att_v2(
         #     self.D, self.D, [self.D], [self.D], attn_score_cross=self.attn_score_cross
         # )
+        
+        self.bls_out_dim = 64
 
-        # D * (3+4) + D//2 * 3 + 2 * 2 * (D*2) + 22 * 2
-        self.fc_tower = fc_repeats(15 * self.D + 3 * (self.D // 2) + 44, shape=[256, 128, 64, 2], acts=['dice', 'dice', 'dice', 'dice', 'dice', None])
+        # 原始 MUSE 的基础拼接维度（不包含 BLS）
+        # base_din_dim = 15 * D + 3 * (D // 2) + 44
+        base_din_dim = 15 * self.D + 3 * (self.D // 2) + 44
+        
+        # 当前数据流里 ad + user 的实际拼接宽度为 102。
+        # 即使远端暂时没有同步到 LazyLinear 版本，这里也不能传 0，
+        # 否则会直接初始化出 0x128 的线性层权重。
+        self.bls_non_seq_dim = int(self.args.get("bls_non_seq_dim", 102))
+        self.bls_num_layers = int(self.args.get("bls_num_layers", 1))
+
+        self.bls_fusion = HyBroadFusion(
+            seq_dim=8 * self.D,   # 8 * 32 = 256
+            non_seq_dim=self.bls_non_seq_dim,
+            num_feat_nodes=128, 
+            num_cross_nodes=128, 
+            out_dim=self.bls_out_dim,
+            num_layers=self.bls_num_layers
+        )
+        self.bls_gate = torch.nn.Parameter(torch.tensor(0.1))
+
+        # 最终 MLP 输入维度 = 原始 base_din_dim + bls_out_dim
+        din_dim = base_din_dim + self.bls_out_dim
+        self.fc_tower = fc_repeats(din_dim, shape=[256, 128, 64, 2], acts=['dice', 'dice', 'dice', 'dice', 'dice', None])
         
         self.use_aux_loss = self.args["use_aux_loss"]
         if self.use_aux_loss:
@@ -132,8 +156,15 @@ class MUSE_DIN(torch.nn.Module):
 
         ad, user = torch.concat(ad_embs, dim=1), torch.concat(user_embs, dim=1)
 
-        uni_seq_att_v2 = uni_seq_att_v2.mean(dim=1)
-        rt_att = rt_att.mean(dim=1)
+        # 保持与初始化传入维度一致
+        # rt_att_out: [B, 1, 2D]
+        # uni_seq_att_out_v2: [B, 1, 2D]
+        uni_seq_att_v2 = uni_seq_att_v2.mean(dim=1)  # [B, 2D]
+        rt_att = rt_att.mean(dim=1)                  # [B, 2D]
+
+        # squeeze 1 维，使其变为 [B, 2D]
+        rt_att_out = rt_att_out.squeeze(1)
+        uni_seq_att_out_v2 = uni_seq_att_out_v2.squeeze(1)
         
         # if eval_flag:
         #     norm_list = [
@@ -161,10 +192,36 @@ class MUSE_DIN(torch.nn.Module):
         # ad = torch.zeros_like(ad).detach()
         # user = torch.zeros_like(user).detach()
 
-        din = torch.concat(
-            [rt_att_out, uni_seq_att_out_v2, uni_seq_att_v2, rt_att, ad, user]+all_seq_image_res[1],
+        # 准备 BLS 的输入特征
+        # rt_att_out (2*D), uni_seq_att_out_v2 (2*D), uni_seq_att_v2 (2*D), rt_att (2*D) => 8*D
+        seq_features_for_bls = torch.concat(
+            [rt_att_out, uni_seq_att_out_v2, uni_seq_att_v2, rt_att], 
             dim=1
         )
+        non_seq_features_for_bls = torch.concat(
+            [ad, user], 
+            dim=1
+        )
+
+        if seq_features_for_bls.shape[1] != self.bls_fusion.seq_feature_mapper.in_features:
+            raise RuntimeError(
+                f"BLS seq dim mismatch: got {seq_features_for_bls.shape[1]}, "
+                f"expect {self.bls_fusion.seq_feature_mapper.in_features}"
+            )
+        # 通过 BLS 计算交叉增强特征
+        bls_cross_feature = self.bls_gate * self.bls_fusion(seq_features_for_bls, non_seq_features_for_bls)
+        bls_cross_feature = torch.nan_to_num(bls_cross_feature, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # 加入到原有 din 拼接中
+        din = torch.concat(
+            [rt_att_out, uni_seq_att_out_v2, uni_seq_att_v2, rt_att, ad, user] + all_seq_image_res[1] + [bls_cross_feature],
+            dim=1
+        )
+        expected_fc_in = self.fc_tower.linears[0].in_features
+        if din.shape[1] != expected_fc_in:
+            raise RuntimeError(
+                f"fc_tower input dim mismatch: got {din.shape[1]}, expect {expected_fc_in}"
+            )
         # print(f"ad shape: {ad.shape}, user shape: {user.shape}, all shape: {din.shape}")
 
         item_fc6 = self.fc_tower(din)
@@ -195,7 +252,9 @@ class MUSE_DIN(torch.nn.Module):
             'all_seq_image_res': self.all_seq_image_res.state_dict(),
             'realtime_att': self.realtime_att.state_dict(),
             'uni_att_v2': self.uni_att_v2.state_dict(),
-            'fc_tower': self.fc_tower.state_dict()
+            'fc_tower': self.fc_tower.state_dict(),
+            'bls_fusion': self.bls_fusion.state_dict(),
+            'bls_gate': self.bls_gate.detach().cpu()
         }
 
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
@@ -218,6 +277,10 @@ class MUSE_DIN(torch.nn.Module):
         self.realtime_att.load_state_dict(ckpt['realtime_att'])
         self.uni_att_v2.load_state_dict(ckpt['uni_att_v2'])
         self.fc_tower.load_state_dict(ckpt['fc_tower'])
+        if 'bls_fusion' in ckpt:
+            self.bls_fusion.load_state_dict(ckpt['bls_fusion'], strict=False)
+        if 'bls_gate' in ckpt:
+            self.bls_gate.data.copy_(ckpt['bls_gate'].to(self.bls_gate.device))
 
         logging.info(f"[Rank {device_id}] Checkpoint loaded from {ckpt_path}")
         return self
