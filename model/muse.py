@@ -49,6 +49,11 @@ class MUSE_DIN(torch.nn.Module):
         if self.use_aux_loss:
             self.fc_tower_aux = fc_repeats(self.D * 4, shape=[200, 80, 2], acts=['dice', 'dice', None])
 
+        self.use_kl_loss = self.args.get("use_kl_loss", True)
+        self.kl_loss_weight = float(self.args.get("kl_loss_weight", 0.05))
+        self.kl_temperature = max(float(self.args.get("kl_temperature", 1.0)), 1e-6)
+        self.kl_eps = float(self.args.get("kl_eps", 1e-8))
+
         self.reset_parameters()
 
     def reset_parameters(self): 
@@ -124,6 +129,22 @@ class MUSE_DIN(torch.nn.Module):
 
         # use DIN for ESU
         uni_seq_att_out_v2 = self.uni_att_v2(att_ad_2, uni_seq_att_v2, mm_cosine=[all_seq_image_res[0][1]])
+
+        # KL regularization: force ID attention distribution to align with image-similarity distribution
+        loss_kl = torch.zeros((), dtype=label.dtype, device=label.device)
+        if self.use_kl_loss and self.args["method"] not in ["din"]:
+            id_attn_dist = self.uni_att_v2.calc_attn_score(att_ad_2, uni_seq_att_v2)
+            id_attn_dist = id_attn_dist / (id_attn_dist.sum(dim=1, keepdim=True) + self.kl_eps)
+
+            image_attn_dist = torch.nn.functional.softmax(
+                all_seq_image_res[0][1] / self.kl_temperature,
+                dim=1,
+            ).detach()
+            loss_kl = torch.nn.functional.kl_div(
+                torch.log(id_attn_dist + self.kl_eps),
+                image_attn_dist,
+                reduction="batchmean",
+            )
         # uni_seq_att_out_v2 = [
         #     self.uni_att_item(att_ad_2[..., :16], uni_seq_att_v2[..., :16], mm_cosine=[all_seq_image_res[0][1]]),
         #     self.uni_att_cate(att_ad_2[..., 16:], uni_seq_att_v2[..., 16:], mm_cosine=[all_seq_image_res[0][1]])
@@ -181,9 +202,9 @@ class MUSE_DIN(torch.nn.Module):
                 torch.nn.functional.softmax(fc_out_aux, dim=-1) + 0.0000001
             )
             loss_aux = -(torch.log(prop_aux) * label).sum(dim=1, keepdim=True)
-            total_loss = loss_ce.mean(dim=0) + loss_aux.mean(dim=0)
+            total_loss = loss_ce.mean(dim=0) + loss_aux.mean(dim=0) + self.kl_loss_weight * loss_kl
         else:
-            total_loss = loss_ce.mean(dim=0)
+            total_loss = loss_ce.mean(dim=0) + self.kl_loss_weight * loss_kl
 
         return total_loss, prop
     
