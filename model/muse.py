@@ -53,7 +53,7 @@ class MUSE_DIN(torch.nn.Module):
         # 即使远端暂时没有同步到 LazyLinear 版本，这里也不能传 0，
         # 否则会直接初始化出 0x128 的线性层权重。
         self.bls_non_seq_dim = int(self.args.get("bls_non_seq_dim", 102))
-        self.bls_num_layers = int(self.args.get("bls_num_layers", 1))
+        self.bls_num_layers = int(self.args.get("bls_num_layers", 3))
 
         self.bls_fusion = HyBroadFusion(
             seq_dim=8 * self.D,   # 8 * 32 = 256
@@ -65,16 +65,21 @@ class MUSE_DIN(torch.nn.Module):
         )
         self.bls_gate = torch.nn.Parameter(torch.tensor(0.1))
 
-        # 最终 MLP 输入维度 = 原始 base_din_dim + bls_out_dim
-        din_dim = base_din_dim + self.bls_out_dim
+        # 最终 MLP 输入维度 = 原始 base_din_dim (宽度侧特征已剥离)
+        din_dim = base_din_dim
         self.fc_tower = fc_repeats(din_dim, shape=[256, 128, 64, 2], acts=['dice', 'dice', 'dice', 'dice', 'dice', None])
+
+        # Side wide branch: consumes BLS output only for ablation.
+        self.wide_layer = torch.nn.Linear(self.bls_out_dim, 2)
+        torch.nn.init.zeros_(self.wide_layer.weight)
+        torch.nn.init.zeros_(self.wide_layer.bias)
         
         self.use_aux_loss = self.args["use_aux_loss"]
         if self.use_aux_loss:
             self.fc_tower_aux = fc_repeats(self.D * 4, shape=[200, 80, 2], acts=['dice', 'dice', None])
 
         self.use_kl_loss = self.args.get("use_kl_loss", True)
-        self.kl_loss_weight = float(self.args.get("kl_loss_weight", 0.1))
+        self.kl_loss_weight = float(self.args.get("kl_loss_weight", 0.05))
         self.kl_temperature = max(float(self.args.get("kl_temperature", 1.0)), 1e-6)
         self.kl_eps = float(self.args.get("kl_eps", 1e-8))
 
@@ -83,6 +88,8 @@ class MUSE_DIN(torch.nn.Module):
     def reset_parameters(self): 
         for name, module in self.named_children(): 
             module.reset_parameters()
+        torch.nn.init.zeros_(self.wide_layer.weight)
+        torch.nn.init.zeros_(self.wide_layer.bias)
 
     def forward(
         self,
@@ -234,9 +241,12 @@ class MUSE_DIN(torch.nn.Module):
         bls_cross_feature = self.bls_gate * self.bls_fusion(seq_features_for_bls, non_seq_features_for_bls)
         bls_cross_feature = torch.nan_to_num(bls_cross_feature, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # 加入到原有 din 拼接中
+        # Feed width-network output into the new Wide branch input.
+        wide_branch_input = bls_cross_feature
+
+        # 加入到原有 din 拼接中 (剥离 BLS 特征，让其只走宽分支)
         din = torch.concat(
-            [rt_att_out, uni_seq_att_out_v2, uni_seq_att_v2, rt_att, ad, user] + all_seq_image_res[1] + [bls_cross_feature],
+            [rt_att_out, uni_seq_att_out_v2, uni_seq_att_v2, rt_att, ad, user] + all_seq_image_res[1],
             dim=1
         )
         expected_fc_in = self.fc_tower.linears[0].in_features
@@ -246,7 +256,13 @@ class MUSE_DIN(torch.nn.Module):
             )
         # print(f"ad shape: {ad.shape}, user shape: {user.shape}, all shape: {din.shape}")
 
-        item_fc6 = self.fc_tower(din)
+        deep_logits = self.fc_tower(din)
+        if wide_branch_input.shape[1] != self.wide_layer.in_features:
+            raise RuntimeError(
+                f"wide_layer input dim mismatch: got {wide_branch_input.shape[1]}, expect {self.wide_layer.in_features}"
+            )
+        wide_logits = self.wide_layer(wide_branch_input)
+        item_fc6 = deep_logits + wide_logits
         prop = clip_prop(
             torch.nn.functional.softmax(item_fc6, dim=-1) + 0.0000001
         )
@@ -275,6 +291,7 @@ class MUSE_DIN(torch.nn.Module):
             'realtime_att': self.realtime_att.state_dict(),
             'uni_att_v2': self.uni_att_v2.state_dict(),
             'fc_tower': self.fc_tower.state_dict(),
+            'wide_layer': self.wide_layer.state_dict(),
             'bls_fusion': self.bls_fusion.state_dict(),
             'bls_gate': self.bls_gate.detach().cpu()
         }
@@ -299,6 +316,19 @@ class MUSE_DIN(torch.nn.Module):
         self.realtime_att.load_state_dict(ckpt['realtime_att'])
         self.uni_att_v2.load_state_dict(ckpt['uni_att_v2'])
         self.fc_tower.load_state_dict(ckpt['fc_tower'])
+        if 'wide_layer' in ckpt:
+            wide_layer_state = ckpt['wide_layer']
+            if (
+                wide_layer_state.get('weight', None) is not None
+                and wide_layer_state['weight'].shape == self.wide_layer.weight.shape
+                and wide_layer_state.get('bias', None) is not None
+                and wide_layer_state['bias'].shape == self.wide_layer.bias.shape
+            ):
+                self.wide_layer.load_state_dict(wide_layer_state)
+            else:
+                logging.warning(
+                    f"Skip loading wide_layer due to shape mismatch. ckpt weight {wide_layer_state.get('weight', None).shape if wide_layer_state.get('weight', None) is not None else 'None'} vs model weight {self.wide_layer.weight.shape}"
+                )
         if 'bls_fusion' in ckpt:
             self.bls_fusion.load_state_dict(ckpt['bls_fusion'], strict=False)
         if 'bls_gate' in ckpt:
